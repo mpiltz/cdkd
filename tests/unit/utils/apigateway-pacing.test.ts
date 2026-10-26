@@ -181,6 +181,27 @@ describe('withApiGatewayPacing against a real SDK client', () => {
     return { client, sentAt };
   };
 
+  // `setImmediate` is not faked, so these yield to the REAL event loop. The SDK
+  // reaches the pacing middleware only after async setup that runs on it (the
+  // first call of a process pays the most), and fake time cannot drive that: a
+  // clock advanced before the calls have arrived finishes while nothing sleeps
+  // yet, and the sleeps registered afterwards are never fired.
+  const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  /** Waits, without moving the clock, until `count` calls have reached the pacer. */
+  const untilArrived = async (count: number) => {
+    const reserve = vi.spyOn(apiGatewayPacerFor('eu-west-1'), 'reserveOperation');
+    while (reserve.mock.calls.length < count) await yieldToEventLoop();
+  };
+
+  /** Advances the clock until `done`, giving the event loop a turn in between. */
+  const advanceUntil = async (done: () => boolean) => {
+    while (!done()) {
+      await vi.advanceTimersByTimeAsync(250);
+      await yieldToEventLoop();
+    }
+  };
+
   beforeEach(() => {
     // `performance` too: the pacer counts on it, and the shared-token loop
     // would spin on the real clock while its sleeps run on the fake one.
@@ -198,7 +219,8 @@ describe('withApiGatewayPacing against a real SDK client', () => {
     );
 
     const settled = Promise.all(sends);
-    for (let i = 0; i < 40; i++) await vi.advanceTimersByTimeAsync(250);
+    await untilArrived(8);
+    await vi.advanceTimersByTimeAsync(2_000);
     await settled;
 
     const gaps = sentAt.slice(5).map((at, i) => at - sentAt[4 + i]!);
@@ -215,6 +237,7 @@ describe('withApiGatewayPacing against a real SDK client', () => {
     const settled = Promise.all(
       Array.from({ length: 33 }, () => client.send(new GetRestApiCommand({ restApiId: 'a' })))
     );
+    await untilArrived(33);
     await vi.advanceTimersByTimeAsync(1_000);
     await settled;
 
@@ -231,6 +254,7 @@ describe('withApiGatewayPacing against a real SDK client', () => {
     const settled = client.send(
       new CreateResourceCommand({ restApiId: 'a', parentId: 'p', pathPart: 'x' })
     );
+    await untilArrived(1);
     await vi.advanceTimersByTimeAsync(1_000);
     await settled;
 
@@ -243,7 +267,9 @@ describe('withApiGatewayPacing against a real SDK client', () => {
     const reserve = vi.spyOn(apiGatewayPacerFor('eu-west-1'), 'reserveOperation');
 
     const send = client.send(new GetRestApiCommand({ restApiId: 'a' }));
-    for (let i = 0; i < 120; i++) await vi.advanceTimersByTimeAsync(250);
+    // The retry's backoff timer is registered only after the throttled
+    // response has been handled, so advance until the second attempt is sent.
+    await advanceUntil(() => sentAt.length >= 2);
     await send;
 
     expect(sentAt).toHaveLength(2);
